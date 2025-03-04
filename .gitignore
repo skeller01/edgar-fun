@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+
 # C extensions
 *.so
 
@@ -169,3 +170,16 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Ignore data folders and output files
+data/
+*.idx
+*.csv
+*.txt
+
+# Local EDGAR index data
+edgar_index/
+
+# Downloaded N-PX filings
+npx_filings/
+
