@@ -17,8 +17,7 @@ CREATE TABLE issuer (
   issuer_name  VARCHAR(255),
   cusip        VARCHAR(20),
   isin         VARCHAR(20),
-  figi         VARCHAR(20),
-  lei          VARCHAR(50)
+  figi         VARCHAR(20)
 );
 
 CREATE TABLE vote (
