@@ -1,0 +1,98 @@
+Start a transaction.
+
+BEGIN;
+
+Run your TRUNCATE … RESTART IDENTITY CASCADE block.
+Nothing is really deleted yet—it’s only staged inside the transaction.
+
+If you decide you’re happy, finish with
+
+COMMIT;
+
+The wipe becomes permanent.
+
+If you realise you pointed at the wrong database or fat-fingered the table list, simply type
+
+    ROLLBACK;
+
+    and Postgres will undo everything that happened since BEGIN;.
+
+    In DBeaver:
+
+        Click the little “Auto-commit” toggle so it turns off before running the script.
+
+        Execute the statements. You’ll see a yellow bar saying “Transaction in progress.”
+
+        Choose Commit or Rollback on the toolbar when you’re ready.
+
+If Auto-commit is on, each statement is committed immediately and you cannot roll it back—so always turn it off for destructive operations.
+
+
+Updates 
+/* ────────────────────────────────────────────────────────────────────
+   0.  SAFETY  – run inside a transaction so you can ROLLBACK if needed
+   ────────────────────────────────────────────────────────────────────*/
+BEGIN;
+
+/* ────────────────────────────────────────────────────────────────────
+   1.  form_npx  – new raw-date columns + length fixes
+   ────────────────────────────────────────────────────────────────────*/
+ALTER TABLE form_npx
+    -- raw date strings
+    ADD COLUMN period_of_report_raw   CHAR(10),
+    ADD COLUMN date_expired_denied    CHAR(10),
+    ADD COLUMN date_reported          CHAR(10),
+    ADD COLUMN tx_as_of_date_raw      CHAR(10),
+    ADD COLUMN year_or_quarter        CHAR(7),
+    ADD COLUMN report_calendar_year   CHAR(4),
+    ADD COLUMN report_quarter_year    CHAR(4),
+
+    -- widen undersized columns
+    ALTER COLUMN notice_explanation  TYPE VARCHAR(255),
+    ALTER COLUMN explanatory_notes   TYPE VARCHAR(4000);
+
+/* ────────────────────────────────────────────────────────────────────
+   2.  proxy_voting_record – raw meeting date + wider numerics
+   ────────────────────────────────────────────────────────────────────*/
+ALTER TABLE proxy_voting_record
+    ADD COLUMN meeting_date_raw   CHAR(10),
+
+    -- widen numeric precision (24 digits, 10 decimals = room to grow)
+    ALTER COLUMN shares_voted     TYPE NUMERIC(30,10)
+        USING shares_voted::NUMERIC(30,10),
+    ALTER COLUMN shares_on_loan   TYPE NUMERIC(30,10)
+        USING shares_on_loan::NUMERIC(30,10),
+    ALTER COLUMN vote_cast_shares TYPE NUMERIC(30,10)
+        USING vote_cast_shares::NUMERIC(30,10);
+
+/* ────────────────────────────────────────────────────────────────────*/
+COMMIT;
+
+Clear the DB 
+
+BEGIN;
+
+/* wipe all transactional data, but keep the lookup tables */
+TRUNCATE TABLE
+    -- bridge tables first (cascading anyway, but listed for clarity)
+    proxy_voting_record_category,
+    voting_record_manager,
+    voting_record_series,
+
+    -- detail tables
+    proxy_voting_record,
+    series_class,
+    series,
+    other_reporting_person,
+    institutional_manager,
+
+    -- the master header (will cascade to children that forgot to list FK)
+    form_npx
+
+RESTART IDENTITY CASCADE;
+
+/* uncomment if you really want to clear the category lookup as well
+TRUNCATE TABLE matter_category RESTART IDENTITY;
+*/
+
+COMMIT;
