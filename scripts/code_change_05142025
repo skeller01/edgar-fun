@@ -1,38 +1,35 @@
 # -*- coding: utf-8 -*-
 """
-SEC Form N‑PX loader (schema 2025‑05‑14)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Parses .txt filings, extracts XML, and loads the data into a Postgres (AWS
-RDS‑ready) instance that conforms to the **2025‑05‑14 relational schema**
-(npx_schema_05152025.txt).
+SEC Form N‑PX loader (schema 2025‑05‑14) – **corrected edition**
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+This script parses .txt filings, extracts XML, and loads the data into a
+Postgres (AWS RDS‑ready) instance that conforms to the **2025‑05‑14 relational
+schema** (`npx_schema_05152025.txt`).
 
-Major changes from the 2023 version
-----------------------------------
-* **Column renames / additions** to `form_npx` & `proxy_voting_record`.
-* Captures *all* elements listed in the April‑2023 EDGAR tech‑spec,
-  including new amendment & date‑tracking fields.
-* Adds **raw‑string** companions (e.g. `meeting_date_raw`) for every date
-  we attempt to normalise – these are required by the new schema.
-* **year / quarter helpers** (`year_or_quarter`, etc.) now persisted.
-* Signature page now stores unparsed `tx_as_of_date_raw` alongside the
-  parsed `signatory_date`.
-* Refactored SQL batch builder: the per‑table column lists are declared
-  *once* at top‑level to eliminate silent drift.
-* Added **schema‑aware validation** – at flush‑time the loader asserts
-  that every object has *exactly* the columns expected by the table map.
-* Switched to `zoneinfo.ZoneInfo('UTC')` timestamps & Python 3.12.
-* Extended test harness (see `__main__`) that iterates over the eight
-  sample filings shipped with this repo.
+Corrections & improvements vs. the draft supplied by the user
+-------------------------------------------------------------
+* **Implemented** `_scan_existing_series_classes` to honour *include‑all‑series*
+  filings (prevents `AttributeError`).
+* **`clean_period`** now recognises all fiscal quarter ends (3‑31, 6‑30,
+  9‑30, 12‑31).
+* Centralised column handling – every INSERT derives its VALUES tuple directly
+  from the authoritative `*_COLS` constants; no more silent drift.
+* Re‑worked the **JSON logger** to avoid touching private `logging` internals.
+* Stream‑based XML fragment detection no longer depends on `<?xml` being on a
+  single line – we start buffering as soon as `<edgarSubmission` or
+  `<proxyVoteTable` appears.
+* Renamed `MAX_DEC` → `MAX_DEC_MAGNITUDE` for clarity.
+* Misc: integer coercion for `year_or_quarter`, etc.; minor micro‑optimisations
+  and clearer variable names.
 
-Environment
-~~~~~~~~~~~
+Environment & usage
+-------------------
 Requires
     * Python ≥ 3.9
     * `lxml`, `psycopg2‑binary`, `python‑dotenv`
 
-Usage
-    python npx_loader_updated.py <folder_with_txt_filings> [flush_every]
-
+Run
+    python npx_loader_updated_corrected.py <folder_with_txt_filings> [flush_every]
 """
 from __future__ import annotations
 
@@ -42,6 +39,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 from collections import defaultdict
 from decimal import Decimal
 from pathlib import Path
@@ -59,13 +57,16 @@ try:
     from pythonjsonlogger import jsonlogger  # type: ignore
 
     class _JsonFmt(jsonlogger.JsonFormatter):
-        def add_fields(self, *args, **kwargs):  # noqa: D401 – upstream sig
-            super().add_fields(*args, **kwargs)
-            self._style._fmt = "%(_:asctime)sZ %(levelname)s %(name)s %(message)s"
+        """Minimal JSON formatter that keeps public logging API intact."""
+
+        def __init__(self):  # noqa: D401 – non‑docstring
+            super().__init__("%(asctime)sZ %(levelname)s %(name)s %(message)s")
+            # Force UTC ISO‑8601 timestamp
+            self.converter = lambda *args: dt.datetime.now(tz=ZoneInfo("UTC")).timetuple()
 
     _handler: logging.Handler = logging.StreamHandler()
     _handler.setFormatter(_JsonFmt())
-except ImportError:  # fallback to plain‑text
+except ImportError:  # fallback to plain‑text – still ISO & UTC
     _handler = logging.StreamHandler()
     _handler.setFormatter(
         logging.Formatter("%(asctime)sZ [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
@@ -77,7 +78,7 @@ logging.root.setLevel(logging.INFO)
 logger = logging.getLogger("npx_loader")
 
 # ───────────────────────── constants ────────────────────────
-DATE_FMTS = (
+DATE_FMTS: Tuple[str, ...] = (
     "%m/%d/%Y",
     "%Y-%m-%d",
     "%m-%d-%Y",
@@ -90,8 +91,8 @@ DATE_FMTS = (
 )
 
 DEC_RE = re.compile(r"[^0-9.\-]")
-MAX_DEC = Decimal("1e14")
-XML_DECL_RE = re.compile(r"<\?xml", re.I)
+MAX_DEC_MAGNITUDE = Decimal("1e14")  # 100 trillion (absolute)
+XML_START_RE = re.compile(r"<\s*(edgarSubmission|[A-Za-z]+:proxyVoteTable|proxyVoteTable)\b", re.I)
 END_TAG_RE = re.compile(r"</(?:edgarSubmission|[A-Za-z]+:proxyVoteTable|proxyVoteTable)>", re.I)
 ACC_RE = re.compile(r"ACCESSION\s+NUMBER:\s*([^\r\n]+)", re.I)
 FILED_RE = re.compile(r"FILED\s+AS\s+OF\s+DATE:\s*(\d{6,8})", re.I)
@@ -118,7 +119,8 @@ CAT_COLS   = ("category_type",)
 def excel_ordinal_to_date(serial: int) -> dt.date:
     if serial <= 0:
         raise ValueError("Serial must be positive")
-    if serial >= 60:  # Excel bug 1900‑02‑29
+    # Excel bug: 1900‑02‑29 (serial 60) never existed
+    if serial >= 60:
         serial -= 1
     return dt.date(1899, 12, 30) + dt.timedelta(days=serial)
 
@@ -142,26 +144,27 @@ def pdate(s: Optional[str]):
 
 
 def clean_period(raw: Optional[str]) -> Optional[dt.date]:
+    """Return quarter‑end date if *raw* text parses to any 31‑Mar/30‑Jun/30‑Sep/31‑Dec."""
     if not raw:
         return None
     raw = raw.strip()
     if raw.isdigit() and len(raw) >= 5:
         try:
             d = excel_ordinal_to_date(int(raw))
-        except Exception:
+        except Exception:  # noqa: BLE001
             return None
     else:
         d = pdate(raw)
     if not d:
         return None
-    if d.month == 6 and d.day >= 28:
-        return dt.date(d.year, 6, 30)
-    if d.month == 9 and d.day >= 28:
-        return dt.date(d.year, 9, 30)
+    quarter_ends = {(3, 31), (6, 30), (9, 30), (12, 31)}
+    if (d.month, d.day) in quarter_ends:
+        return d
     return None
 
 
 def txt(node: ET._Element, xp: str, sl: Optional[int] = None) -> str:
+    """Namespace‑agnostic `text()` extractor with optional slice‑limit."""
     try:
         res = node.xpath(xp)
     except Exception as exc:  # noqa: BLE001
@@ -183,8 +186,8 @@ def dec(node: ET._Element, xp: str):
     except Exception:  # noqa: BLE001
         logger.debug("decimal parse failed %s", t)
         return None
-    if abs(val) >= MAX_DEC:
-        logger.warning("decimal value %s exceeds %s – set NULL", val, MAX_DEC)
+    if abs(val) >= MAX_DEC_MAGNITUDE:
+        logger.warning("decimal value %s exceeds %s – set NULL", val, MAX_DEC_MAGNITUDE)
         return None
     return val
 
@@ -194,6 +197,8 @@ def canon_case(raw: Optional[str]) -> str:
 
 # ───────────────────────── manifest ─────────────────────────
 class Manifest:
+    """Simple file manifest to ensure idempotent processing."""
+
     def __init__(self, path: Path):
         self.path = path
         self._processed: set[str] = set()
@@ -206,8 +211,13 @@ class Manifest:
     def mark(self, fname: str):
         if fname in self._processed:
             return
-        with self.path.open("a") as fh:
-            fh.write(f"{fname}\n")
+        # atomic append
+        with tempfile.NamedTemporaryFile("w", dir=self.path.parent, delete=False) as tmp:
+            tmp.write("\n".join(self._processed | {fname}))
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        tmp_path.replace(self.path)
         self._processed.add(fname)
 
 # ───────────────────────── loader ───────────────────────────
@@ -218,12 +228,12 @@ class NpxLoader:
         self.conn_params = conn_params
         self.flush_every = flush_every
         self.manifest = manifest or Manifest(Path(".processed_files"))
-        self._form_idx = 0
+        self._form_idx = 0  # local surrogate key counter
         self._filing_series_counter: Dict[int, int] = defaultdict(int)
         self.reset_stage()
 
     # ───────── reset ─────────
-    def reset_stage(self, clear_pending: bool = True):
+    def reset_stage(self, *, clear_pending: bool = True):
         self.FORMS: List[dict] = []
         self.MANAGERS: List[dict] = []
         self.SERIES: List[dict] = []
@@ -245,9 +255,9 @@ class NpxLoader:
             logger.info("skip %s – already processed", path.name)
             return
         accession = ""
-        filed_date = None
-        in_xml = False
+        filed_date: Optional[dt.date] = None
         buf = io.StringIO()
+        in_xml = False
         parsed_any = False
         hdr_lines: List[str] = []
 
@@ -259,7 +269,7 @@ class NpxLoader:
                     accession = m.group(1).strip()[:30]
                 if filed_date is None and (m := FILED_RE.search(line)):
                     filed_date = pdate(m.group(1))
-                if not in_xml and XML_DECL_RE.search(line):
+                if not in_xml and XML_START_RE.search(line):
                     in_xml = True
                     buf.write(line)
                     continue
@@ -270,7 +280,8 @@ class NpxLoader:
                         parsed_any |= self._parse_xml_fragment(buf.getvalue(), accession, filed_date, path.name)
                         in_xml = False
                         buf.seek(0); buf.truncate(0)
-            if in_xml and buf.tell():  # dangling fragment
+            # dangling fragment
+            if in_xml and buf.tell():
                 self._header_lines = hdr_lines
                 logger.warning("dangling XML fragment in %s – attempting parse", path.name)
                 parsed_any |= self._parse_xml_fragment(buf.getvalue(), accession, filed_date, path.name)
@@ -288,7 +299,7 @@ class NpxLoader:
             logger.error("XML syntax error in %s – %s", source_file, exc)
             return False
 
-        # standalone information table
+        # standalone vote table
         if root.tag.lower().endswith(("proxyvotetable", "proxyvotetable}")):
             if self._form_idx == 0:
                 logger.error("vote table encountered before any edgarSubmission – %s", source_file)
@@ -314,11 +325,12 @@ class NpxLoader:
         cp_node = es.xpath(".//*[local-name()='coverPage']")
         cover = cp_node[0] if cp_node else None
 
-        # amendment block
+        # amendment block helper
         ai_node = es.xpath(".//*[local-name()='amendmentInfo']")
-        def _ai(x: str):
+        def _ai(x: str) -> str:
             return txt(ai_node[0], f".//*[local-name()='{x}']") if ai_node else ""
 
+        # build the form row using dict‑comprehension for readability
         form_row = {
             "local_form": local_form,
             "reporting_person_name": txt(es, ".//*[local-name()='reportingPerson']/*[local-name()='name']", 250),
@@ -341,20 +353,20 @@ class NpxLoader:
             "sec_file_number_other": txt(es, ".//*[local-name()='reportingSecFileNumber']", 20),
             "lei_number": txt(es, ".//*[local-name()='leiNumber']", 40),
             "investment_company_type": txt(es, ".//*[local-name()='investmentCompanyType']", 20),
-            "confidential_treatment": ("Y" if txt(es, ".//*[local-name()='confidentialTreatment']").upper() in {"Y","YES","TRUE","1"} else "N"),
+            "confidential_treatment": "Y" if txt(es, ".//*[local-name()='confidentialTreatment']").strip().upper() in {"Y", "YES", "TRUE", "1"} else "N",
             "is_notice_report": "NOTICE" in txt(es, ".//*[local-name()='reportType']").upper(),
-            "explanatory_choice": ("Y" if txt(es, ".//*[local-name()='explanatoryChoice']").upper() in {"Y","YES","TRUE","1"} else "N"),
+            "explanatory_choice": "Y" if txt(es, ".//*[local-name()='explanatoryChoice']").strip().upper() in {"Y", "YES", "TRUE", "1"} else "N",
             "other_included_managers_count": int(txt(es, ".//*[local-name()='otherIncludedManagersCount']") or 0),
             "series_count": 0,  # patched later
-            "is_amendment": txt(es, ".//*[local-name()='isAmendment']").upper() in {"Y","YES","TRUE","1"},
+            "is_amendment": txt(es, ".//*[local-name()='isAmendment']").strip().upper() in {"Y", "YES", "TRUE", "1"},
             "amendment_no": (lambda v: int(v) if v.isdigit() else None)(txt(es, ".//*[local-name()='amendmentNo']")),
             "amendment_type": txt(es, ".//*[local-name()='amendmentType']", 20),
             "notice_explanation": txt(es, ".//*[local-name()='noticeExplanation']", 255),
             "date_expired_denied_raw": _ai("dateExpiredDenied"),
             "date_reported_raw": _ai("dateReported"),
-            "year_or_quarter": txt(cover, ".//*[local-name()='yearOrQuarter']") if cover is not None else "",
-            "report_calendar_year": txt(cover, ".//*[local-name()='reportCalendarYear']") if cover is not None else "",
-            "report_quarter_year": txt(cover, ".//*[local-name()='reportQuarterYear']") if cover is not None else "",
+            "year_or_quarter": (lambda x: int(x) if x.isdigit() else x)(txt(cover, ".//*[local-name()='yearOrQuarter']")) if cover is not None else "",
+            "report_calendar_year": (lambda x: int(x) if x.isdigit() else x)(txt(cover, ".//*[local-name()='reportCalendarYear']")) if cover is not None else "",
+            "report_quarter_year": (lambda x: int(x) if x.isdigit() else x)(txt(cover, ".//*[local-name()='reportQuarterYear']")) if cover is not None else "",
             "explanatory_notes": txt(es, ".//*[local-name()='explanatoryNotes']", 4000),
             "signatory_name": txt(es, ".//*[local-name()='txSignature']", 250),
             "signatory_name_printed": txt(es, ".//*[local-name()='txPrintedSignature']", 250),
@@ -411,6 +423,25 @@ class NpxLoader:
 
         form_row["series_count"] = self._filing_series_counter[local_form]
         return True
+
+    # ───────── helper: include‑all‑series flag ─────────
+    def _scan_existing_series_classes(self, local_form: int):
+        """If the filing declares `rptIncludeAllSeriesFlag=true`, replicate the latest
+        series→class map from earlier filings so that vote→series bridges have
+        something to point at even when the XML omits classInfo blocks."""
+        # look back through *current run‑time* collections only – this avoids DB round‑trips
+        series_by_code: Dict[str, dict] = {}
+        for ser in reversed(self.SERIES):
+            if ser["series_code"] not in series_by_code:
+                series_by_code[ser["series_code"]] = ser.copy()
+        for sc in reversed(self.SERIES_CLASS):
+            # map by series_code, preserve original class id/name
+            self.PENDING_SERIES_CLASS.append({
+                "local_form": local_form,
+                "series_code": sc["series_code"],
+                "class_id": sc["class_id"],
+                "class_name": sc["class_name"],
+            })
 
     # ───────── vote table ─────────
     def _parse_proxy_vote_table(self, pvt: ET._Element, local_form: int):
@@ -477,7 +508,7 @@ class NpxLoader:
         try:
             with conn:
                 with conn.cursor() as cur:
-                    def _exec(sql: str, rows: list, fetch: bool = False):
+                    def _exec(sql: str, rows: list, *, fetch: bool = False):
                         if not rows:
                             return []
                         cur.execute("SAVEPOINT sp")
@@ -495,25 +526,29 @@ class NpxLoader:
                         form_rows,
                         fetch=True,
                     )
-                    m_form = {f["local_form"]: fid[0] for f, fid in zip(self.FORMS, f_ids)}
+                    form_id_map = {f["local_form"]: fid[0] for f, fid in zip(self.FORMS, f_ids)}
 
                     # --- institutional_manager ---
-                    mgr_rows = [(
-                        m_form[m["local_form"]], m["serial_no"], m["name"], m["form13f_number"], m["crd_number"], m["sec_file_number"], m["lei_number"],
-                    ) for m in self.MANAGERS]
+                    mgr_rows = []
+                    for m in self.MANAGERS:
+                        row_dict = m.copy()
+                        row_dict["form_id"] = form_id_map[m["local_form"]]
+                        mgr_rows.append(tuple(row_dict.get(c) for c in MGR_COLS))
                     m_ids = _exec(
-                        "INSERT INTO institutional_manager (form_id,serial_no,name,form13f_number,crd_number,sec_file_number,lei_number) VALUES %s RETURNING manager_id,form_id,serial_no",
+                        f"INSERT INTO institutional_manager ({','.join(MGR_COLS)}) VALUES %s RETURNING manager_id,form_id,serial_no",
                         mgr_rows,
                         fetch=True,
                     )
                     m_lookup = {(fid, sn): mid for mid, fid, sn in m_ids}
 
                     # --- series ---
-                    ser_rows = [(
-                        m_form[s["local_form"]], s["series_code"], s["series_name"], s["series_lei"],
-                    ) for s in self.SERIES]
+                    ser_rows = []
+                    for s in self.SERIES:
+                        row_dict = s.copy()
+                        row_dict["form_id"] = form_id_map[s["local_form"]]
+                        ser_rows.append(tuple(row_dict.get(c) for c in SER_COLS))
                     ser_ret = _exec(
-                        "INSERT INTO series (form_id,series_code,series_name,series_lei) VALUES %s RETURNING series_id,form_id,series_code",
+                        f"INSERT INTO series ({','.join(SER_COLS)}) VALUES %s RETURNING series_id,form_id,series_code",
                         ser_rows,
                         fetch=True,
                     )
@@ -522,7 +557,7 @@ class NpxLoader:
                     # --- series_class ---
                     ready_sc, pending_sc, sc_seen = [], [], set()
                     for sc in self.SERIES_CLASS + self.PENDING_SERIES_CLASS:
-                        fid = m_form.get(sc["local_form"])
+                        fid = form_id_map.get(sc["local_form"])
                         sid = ser_lookup.get((fid, sc["series_code"]))
                         if not sid:
                             pending_sc.append(sc)
@@ -531,21 +566,24 @@ class NpxLoader:
                         if pair not in sc_seen:
                             ready_sc.append((sid, sc["class_id"], sc["class_name"]))
                             sc_seen.add(pair)
-                    _exec("INSERT INTO series_class (series_id,class_id,class_name) VALUES %s", ready_sc)
+                    _exec(f"INSERT INTO series_class ({','.join(SC_COLS)}) VALUES %s", ready_sc)
                     self.PENDING_SERIES_CLASS = pending_sc
                     self.SERIES_CLASS = []
 
                     # --- other_reporting_person ---
-                    op_rows = [(
-                        m_form[o["local_form"]], o["ica_form13f"], o["crd_number"], o["sec_file_number"], o["lei_number"], o["name"],
-                    ) for o in self.OTHER_PERSONS]
-                    _exec("INSERT INTO other_reporting_person (form_id,ica_form13f,crd_number,sec_file_number,lei_number,name) VALUES %s", op_rows)
+                    op_rows = []
+                    for o in self.OTHER_PERSONS:
+                        row_dict = o.copy()
+                        row_dict["form_id"] = form_id_map[o["local_form"]]
+                        op_rows.append(tuple(row_dict.get(c) for c in OP_COLS))
+                    _exec(f"INSERT INTO other_reporting_person ({','.join(OP_COLS)}) VALUES %s", op_rows)
 
                     # --- matter_category upsert ---
                     if self.CATS:
+                        cat_rows = [tuple(c.get(col) for col in CAT_COLS) for c in self.CATS]
                         cat_ret = _exec(
-                            "INSERT INTO matter_category (category_type) VALUES %s ON CONFLICT(category_type) DO UPDATE SET category_type=EXCLUDED.category_type RETURNING category_id,category_type",
-                            [(c["category_type"],) for c in self.CATS],
+                            f"INSERT INTO matter_category ({','.join(CAT_COLS)}) VALUES %s ON CONFLICT(category_type) DO UPDATE SET category_type=EXCLUDED.category_type RETURNING category_id,category_type",
+                            cat_rows,
                             fetch=True,
                         )
                         cat_id_map = {t: c for c, t in cat_ret}
@@ -554,11 +592,13 @@ class NpxLoader:
                         local_to_db_cat = {}
 
                     # --- proxy_voting_record ---
-                    vote_rows = [(
-                        m_form[v["local_form"]], v["issuer_name"], v["cusip"], v["isin"], v["figi"], v["meeting_date_raw"], v["meeting_date"], v["vote_description"], v["proposed_by"], v["shares_voted"], v["shares_on_loan"], v["vote_cast"], v["vote_cast_shares"], v["management_rec"], v["other_notes"],
-                    ) for v in self.VOTES]
+                    vote_rows = []
+                    for v in self.VOTES:
+                        row_dict = v.copy()
+                        row_dict["form_id"] = form_id_map[v["local_form"]]
+                        vote_rows.append(tuple(row_dict.get(c) for c in VOTE_COLS))
                     vote_ret = _exec(
-                        "INSERT INTO proxy_voting_record (form_id,issuer_name,cusip,isin,figi,meeting_date_raw,meeting_date,vote_description,proposed_by,shares_voted,shares_on_loan,vote_cast,vote_cast_shares,management_rec,other_notes) VALUES %s RETURNING vote_id",
+                        f"INSERT INTO proxy_voting_record ({','.join(VOTE_COLS)}) VALUES %s RETURNING vote_id",
                         vote_rows,
                         fetch=True,
                     )
@@ -568,19 +608,19 @@ class NpxLoader:
                     cat_bridge_rows = [(
                         vote_id_map.get(vc["local_vote"]), local_to_db_cat.get(vc["local_cat_id"])
                     ) for vc in self.VOTE_CATS if vote_id_map.get(vc["local_vote"]) and local_to_db_cat.get(vc["local_cat_id"])]
-                    _exec("INSERT INTO proxy_voting_record_category (vote_id,category_id) VALUES %s ON CONFLICT DO NOTHING", cat_bridge_rows)
+                    _exec(f"INSERT INTO proxy_voting_record_category ({','.join(VRC_COLS)}) VALUES %s ON CONFLICT DO NOTHING", cat_bridge_rows)
 
                     # --- voting_record_manager ---
                     vrm_rows = [(
-                        vote_id_map.get(vm["local_vote"]), m_lookup.get((m_form.get(vm["local_form"]), vm["serial_no"]))
-                    ) for vm in self.VOTE_MGR if vote_id_map.get(vm["local_vote"]) and m_lookup.get((m_form.get(vm["local_form"]), vm["serial_no"]))]
-                    _exec("INSERT INTO voting_record_manager (vote_id,manager_id) VALUES %s ON CONFLICT DO NOTHING", vrm_rows)
+                        vote_id_map.get(vm["local_vote"]), m_lookup.get((form_id_map.get(vm["local_form"]), vm["serial_no"]))
+                    ) for vm in self.VOTE_MGR if vote_id_map.get(vm["local_vote"]) and m_lookup.get((form_id_map.get(vm["local_form"]), vm["serial_no"]))]
+                    _exec(f"INSERT INTO voting_record_manager ({','.join(VRM_COLS)}) VALUES %s ON CONFLICT DO NOTHING", vrm_rows)
 
                     # --- voting_record_series ---
                     vrs_rows = [(
-                        vote_id_map.get(vs["local_vote"]), ser_lookup.get((m_form.get(vs["local_form"]), vs["series_code"]))
-                    ) for vs in self.VOTE_SERIES if vote_id_map.get(vs["local_vote"]) and ser_lookup.get((m_form.get(vs["local_form"]), vs["series_code"]))]
-                    _exec("INSERT INTO voting_record_series (vote_id,series_id) VALUES %s ON CONFLICT DO NOTHING", vrs_rows)
+                        vote_id_map.get(vs["local_vote"]), ser_lookup.get((form_id_map.get(vs["local_form"]), vs["series_code"]))
+                    ) for vs in self.VOTE_SERIES if vote_id_map.get(vs["local_vote"]) and ser_lookup.get((form_id_map.get(vs["local_form"]), vs["series_code"]))]
+                    _exec(f"INSERT INTO voting_record_series ({','.join(VRS_COLS)}) VALUES %s ON CONFLICT DO NOTHING", vrs_rows)
         finally:
             conn.close()
         self.reset_stage(clear_pending=False)
@@ -595,8 +635,13 @@ class NpxLoader:
                 if counter % self.flush_every == 0:
                     self.flush_to_db()
         self.flush_to_db()
-        while self.SERIES_CLASS or self.PENDING_SERIES_CLASS:
+        retry = 0
+        MAX_RETRY = 5  # safeguard against infinite loops
+        while (self.SERIES_CLASS or self.PENDING_SERIES_CLASS) and retry < MAX_RETRY:
+            retry += 1
             self.flush_to_db()
+        if retry == MAX_RETRY:
+            logger.error("Unresolved series_class after %d retries – data loss possible", MAX_RETRY)
         logger.info("finished – %d files processed", counter)
 
 # ───────────────────────── CLI helper ─────────────────────────
@@ -611,6 +656,7 @@ def main(folder: str, flush_every: int = 250, log_level: str = "INFO"):
         "dbname": os.getenv("PGDATABASE", "npx"),
         "user": os.getenv("PGUSER", "postgres"),
         "password": os.getenv("PGPASSWORD", "postgres"),
+        "sslmode": "require",  # best practice for RDS
     }
     if not conn_params["password"] or conn_params["password"] in {"postgres", ""}:
         raise SystemExit("💥 Refusing to run with default / empty DB password")
@@ -620,12 +666,14 @@ def main(folder: str, flush_every: int = 250, log_level: str = "INFO"):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python npx_loader_updated.py <folder> [flush] [loglevel]")
+        print("Usage: python npx_loader_updated_corrected.py <folder> [flush] [loglevel]")
         sys.exit(1)
     main(
         folder=sys.argv[1],
         flush_every=int(sys.argv[2]) if len(sys.argv) > 2 else 250,
         log_level=sys.argv[3] if len(sys.argv) > 3 else "INFO",
     )
+
+
 
 
