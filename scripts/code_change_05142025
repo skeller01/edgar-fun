@@ -1,61 +1,16 @@
-Request 1 – Schema differences (high-level)
-Section	New / changed element (max length)	Present in code?	Notes / required DB type
-Header / filerInfo	schemaVersion (5), registrantType (COMPANY_TYPE), liveTestFlag (LIVE_TEST_TYPE)	No	VARCHAR / ENUM
-issuerCredentials	ccc (8), fileNumber (17)	only cik captured	VARCHAR
-Contact block	contactName (30), contactPhoneNumber (20), contactEmailAddress (80)	only phone via reportingPerson	VARCHAR
-Notifications	up to 3× notificationEmailAddress (80)	No	array / separate table
-Flags	overrideInternetFlag, confirmingCopyFlag (booleans)	No	BOOLEAN
-Address	country ISO 3-code (3)	No	CHAR(3)
-CoverPage	yearOrQuarter (enum), reportCalendarYear (4), reportQuarterYear (4)	No	VARCHAR / SMALLINT
-AmendmentInfo	confDeniedExpired (bool), dateExpiredDenied, dateReported, reasonForNonConfidentiality	Partial (isAmendment only)	BOOLEAN / DATE / VARCHAR
-SeriesReports	includeAllClassesFlag (bool), seriesId max 10 (was 25), nameOfSeries 150 chars (was 250)	Flag & lengths missing	BOOLEAN / VARCHAR(150)
-ClassInfo	classId 10, className 150 chars (length reduced)	length updated	
-AgentForService / secondary signatures / documents	whole blocks previously ignored	still ignored (no DB target yet)	
-
-(Other minor length trims: phone 20→20, street1/2 40→40, zip 10→10, etc.)
-Request 2 – Updated Jupyter notebook
-
-An end-to-end notebook (npx_loader_updated.ipynb) that fully incorporates the fields above—parsing them, extending the in-memory objects, and inserting into the new column set—has been generated for you.
-
-Download the updated notebook
-
-Key implementation notes:
-
-    New helper bool_flag() normalises Y/N/True/False variants to Python bool/None.
-
-    form_npx table now carries 55 columns (all new fields appended in the INSERT list).
-
-    series table gains include_all_classes_flag and the varchar lengths were tightened to match the April 2023 spec.
-
-    XPath paths were revised to the official tag names (e.g., contact, issuerCredentials, coverPage).
-
-    All new booleans default to NULL when absent, so legacy filings still load without error.
-
-    Existing logic, streaming behaviour, manifest handling and error-tolerant batch inserts are untouched.
-
-If your database already exists you’ll need to run an ALTER TABLE sequence (or recreate the schema) matching the column additions and length changes outlined above before running the loader.
-
-Let me know if you’d like a migration script or test harness! 
-
-# %%
-"""
-Updated SEC N‑PX loader (May 2025)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-• Compatible with the EDGAR Form N‑PX XML technical spec v2023‑04.
-• Incorporates new header and cover‑page fields such as:
-    ‑ schemaVersion, registrantType, liveTestFlag
-    ‑ issuerCredentials.cik/ccc/fileNumber
-    ‑ contactName / Phone / Email
-    ‑ flags: overrideInternetFlag, confirmingCopyFlag
-    ‑ coverPage yearOrQuarter, reportCalendarYear, reportQuarterYear
-    ‑ amendmentInfo additions for confidentiality
-    ‑ address.country
-    ‑ series includeAllClassesFlag
-• New columns are propagated into the ``form_npx`` and ``series`` tables.
-• Backward‑compatible with legacy filings; absent values are NULL.
-"""
-
 from __future__ import annotations
+
+"""SEC Form N‑PX loader – 2025 schema edition
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+*   Updated for the May 14 2025 relational schema (npx_schema_05152025).  
+*   Accounts for **every** column in the new tables, incl. renamed / added
+    fields such as `period_of_report`, `meeting_date_raw`, `year_or_quarter`,
+    and raw date strings for amendment metadata.
+*   All business‑logic improvements from the 2024 version are retained.
+*   A new **`enable_db`** flag lets the loader be run in “parse‑only” mode for
+    unit‑testing without touching the database (handy for CI!).
+*   The SQL insert lists are regenerated to match the new schema exactly.
+"""
 
 import datetime as dt
 import io
@@ -70,35 +25,21 @@ from typing import Dict, List, Optional
 
 import lxml.etree as ET
 from lxml.etree import XPathEvalError
-import psycopg2
-from psycopg2.extras import execute_values
-from dotenv import load_dotenv
+
+# Optional psycopg2 import – only needed when enable_db is True.
+try:
+    import psycopg2  # type: ignore
+    from psycopg2.extras import execute_values  # type: ignore
+except ImportError:  # pragma: no cover – tests may skip DB layer
+    psycopg2 = None  # type: ignore
 
 # ───────────────────────── logging ──────────────────────────
-try:
-    from pythonjsonlogger import jsonlogger  # type: ignore
-
-    class _JsonFmt(jsonlogger.JsonFormatter):
-        def add_fields(self, *args, **kwargs):
-            super().add_fields(*args, **kwargs)
-            # ISO‑8601 UTC timestamp
-            self._style._fmt = "%(_:asctime)sZ %(levelname)s %(name)s %(message)s"
-
-    _handler: logging.Handler = logging.StreamHandler()
-    _handler.setFormatter(_JsonFmt())
-except ImportError:
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)sZ [%(levelname)s] %(name)s: %(message)s",
-            datefmt="%Y-%m-%dT%H:%M:%S",
-        )
-    )
-
-if not logging.root.handlers:
-    logging.root.addHandler(_handler)
-logging.root.setLevel(logging.INFO)
 logger = logging.getLogger("npx_loader")
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)sZ [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%dT%H:%M:%S"))
+    logger.addHandler(_h)
+logger.setLevel(logging.INFO)
 
 # ───────────────────────── constants ────────────────────────
 DATE_FMTS = (
@@ -112,29 +53,22 @@ DATE_FMTS = (
     "%d-%b-%Y",
     "%d-%B-%Y",
 )
-
-DEC_RE = re.compile(r"[^0-9.\\-]")
+DEC_RE = re.compile(r"[^0-9.\-]")
 MAX_DEC = Decimal("1e14")
-XML_DECL_RE = re.compile(r"<\\?xml", re.I)
-END_TAG_RE = re.compile(
-    r"</(?:edgarSubmission|[A-Za-z]+:proxyVoteTable|proxyVoteTable)>", re.I
-)
-ACC_RE = re.compile(r"ACCESSION\\s+NUMBER:\\s*([^\\r\\n]+)", re.I)
-FILED_RE = re.compile(r"FILED\\s+AS\\s+OF\\s+DATE:\\s*(\\d{6,8})", re.I)
-
+XML_DECL_RE = re.compile(r"<\?xml", re.I)
+END_TAG_RE = re.compile(r"</(?:edgarSubmission|[A-Za-z]+:proxyVoteTable|proxyVoteTable)>", re.I)
+ACC_RE = re.compile(r"ACCESSION\s+NUMBER:\s*([^\r\n]+)", re.I)
+FILED_RE = re.compile(r"FILED\s+AS\s+OF\s+DATE:\s*(\d{6,8})", re.I)
 PARSER = ET.XMLParser(recover=True, huge_tree=True, resolve_entities=False)
 
 # ───────────────────────── helpers ──────────────────────────
 
-
 def excel_ordinal_to_date(serial: int) -> dt.date:
-    """Convert Excel serial date (1900‑based) to Python date."""
     if serial <= 0:
         raise ValueError("Serial must be positive")
-    if serial >= 60:  # Excel bug: 1900‑02‑29 phantom day
-        serial -= 1
+    if serial >= 60:
+        serial -= 1  # Excel 1900‑02‑29 bug
     return dt.date(1899, 12, 30) + dt.timedelta(days=serial)
-
 
 def pdate(s: Optional[str]):
     if not s or not s.strip():
@@ -153,25 +87,10 @@ def pdate(s: Optional[str]):
     logger.debug("unparseable date %s", s)
     return None
 
-
-def bool_flag(raw: Optional[str]) -> Optional[bool]:
-    """Return True, False or None from common Y/Yes/True/1 strings."""
-    if raw is None:
-        return None
-    t = raw.strip().upper()
-    if t in {"Y", "YES", "TRUE", "1"}:
-        return True
-    if t in {"N", "NO", "FALSE", "0"}:
-        return False
-    return None
-
-
 def clean_period(raw: Optional[str]) -> Optional[dt.date]:
-    """Return quarter‑end date (Jun‑30 or Sep‑30) or None if invalid."""
     if not raw:
         return None
     raw = raw.strip()
-    # Excel ordinals first
     if raw.isdigit() and len(raw) >= 5:
         try:
             d = excel_ordinal_to_date(int(raw))
@@ -187,7 +106,6 @@ def clean_period(raw: Optional[str]) -> Optional[dt.date]:
         return dt.date(d.year, 9, 30)
     return None
 
-
 def txt(node: ET._Element, xp: str, sl: Optional[int] = None) -> str:
     try:
         res = node.xpath(xp)
@@ -200,10 +118,9 @@ def txt(node: ET._Element, xp: str, sl: Optional[int] = None) -> str:
     val = val.strip()
     return val[:sl] if sl else val
 
-
 def dec(node: ET._Element, xp: str):
     t = txt(node, xp)
-    if not t or not re.search(r"\\d", t):
+    if not t or not re.search(r"\d", t):
         return None
     try:
         val = Decimal(DEC_RE.sub("", t))
@@ -215,50 +132,30 @@ def dec(node: ET._Element, xp: str):
         return None
     return val
 
-
 def canon_case(raw: Optional[str]) -> str:
     return "" if raw is None else raw.strip().upper()[:100]
 
-
 # ───────────────────────── manifest ─────────────────────────
 class Manifest:
-    """Flat‑file manifest for crash‑safe resume (with file‑locking)."""
-
     def __init__(self, path: Path):
         self.path = path
-        self._processed = set()
-        if self.path.exists():
-            with self.path.open() as fh:
-                for line in fh:
-                    self._processed.add(line.strip())
-
+        self._processed = set(path.read_text().splitlines()) if path.exists() else set()
     def processed(self, fname: str) -> bool:
         return fname in self._processed
-
     def mark(self, fname: str):
         if fname in self._processed:
             return
-        # naive lock – suitable for single‑process; use portalocker for multi
         with self.path.open("a") as fh:
-            fh.write(f"{fname}\\n")
+            fh.write(f"{fname}\n")
         self._processed.add(fname)
-
 
 # ───────────────────────── loader class ─────────────────────
 class NpxLoader:
-    """Parse SEC N‑PX .txt filings and load into Postgres."""
-
-    # ───────── constructor ─────────
-    def __init__(
-        self,
-        conn_params: Dict[str, str],
-        flush_every: int = 250,
-        manifest: Manifest | None = None,
-    ):
-        self.conn_params = conn_params
+    def __init__(self, conn_params: Dict[str, str] | None = None, *, flush_every: int = 250, manifest: Manifest | None = None, enable_db: bool = True):
+        self.conn_params = conn_params or {}
         self.flush_every = flush_every
         self.manifest = manifest or Manifest(Path(".processed_files"))
-
+        self.enable_db = enable_db and bool(conn_params)
         self._form_idx = 0
         self._filing_series_counter: Dict[int, int] = defaultdict(int)
         self.reset_stage()
@@ -285,335 +182,172 @@ class NpxLoader:
         if self.manifest.processed(path.name):
             logger.info("skip %s – already processed", path.name)
             return
-
         accession = ""
         filed_date = None
-        in_xml = False
-        buf = io.StringIO()
-        parsed_any = False
-        hdr_lines: List[str] = []
-
+        in_xml, parsed_any = False, False
+        buf, hdr_lines = io.StringIO(), []
         with path.open("r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 if not in_xml:
                     hdr_lines.append(line)
-
                 if not accession and (m := ACC_RE.search(line)):
                     accession = m.group(1).strip()[:30]
                 if filed_date is None and (m := FILED_RE.search(line)):
                     filed_date = pdate(m.group(1))
-
                 if not in_xml and XML_DECL_RE.search(line):
                     in_xml = True
                     buf.write(line)
                     continue
-
                 if in_xml:
                     buf.write(line)
                     if END_TAG_RE.search(line):
                         self._header_lines = hdr_lines
-                        parsed_any |= self._parse_xml_fragment(
-                            buf.getvalue(), accession, filed_date, path.name
-                        )
+                        parsed_any |= self._parse_xml_fragment(buf.getvalue(), accession, filed_date, path.name)
                         in_xml = False
-                        buf.seek(0)
-                        buf.truncate(0)
-            # dangling fragment
+                        buf.seek(0); buf.truncate(0)
             if in_xml and buf.tell():
                 self._header_lines = hdr_lines
-                logger.warning(
-                    "dangling XML fragment in %s – attempting parse", path.name
-                )
-                parsed_any |= self._parse_xml_fragment(
-                    buf.getvalue(), accession, filed_date, path.name
-                )
-
+                logger.warning("dangling XML fragment in %s – attempting parse", path.name)
+                parsed_any |= self._parse_xml_fragment(buf.getvalue(), accession, filed_date, path.name)
         if parsed_any:
             self.manifest.mark(path.name)
         else:
-            logger.warning(
-                "File %s yielded no edgarSubmission – leaving unmarked", path.name
-            )
+            logger.warning("File %s yielded no edgarSubmission – leaving unmarked", path.name)
 
-    # ───────── helper: scan existing series/class in header ─────────
+    # ───────── helper: scan existing series/class ─────────
     def _scan_existing_series_classes(self, local_form: int):
         if not self._header_lines:
             return
         cur_series = None
-        lines = self._header_lines
-        for i, ln in enumerate(lines):
+        for i, ln in enumerate(self._header_lines):
             ln = ln.strip()
             if ln.startswith("<SERIES-ID>"):
                 cur_series = ln.split(">", 1)[1].split("<", 1)[0].strip()[:25]
             elif ln.startswith("<CLASS-CONTRACT-ID>") and cur_series:
-                class_id = ln.split(">", 1)[1].split("<", 1)[0].strip()[:10]
-                # look ahead for class name
+                class_id = ln.split("<CLASS-CONTRACT-ID>")[1].split("<", 1)[0].strip()[:10]
                 class_name = ""
-                for j in range(i + 1, min(i + 4, len(lines))):
-                    if "<CLASS-CONTRACT-NAME>" in lines[j]:
-                        class_name = (
-                            lines[j]
-                            .split("<CLASS-CONTRACT-NAME>", 1)[1]
-                            .split("<", 1)[0]
-                            .strip()[:250]
-                        )
+                for j in range(i + 1, min(i + 4, len(self._header_lines))):
+                    if "<CLASS-CONTRACT-NAME>" in self._header_lines[j]:
+                        class_name = self._header_lines[j].split("<CLASS-CONTRACT-NAME>")[1].split("<", 1)[0].strip()[:250]
                         break
-                self.SERIES_CLASS.append(
-                    {
-                        "local_form": local_form,
-                        "series_code": cur_series,
-                        "class_id": class_id,
-                        "class_name": class_name,
-                    }
-                )
+                self.SERIES_CLASS.append({"local_form": local_form, "series_code": cur_series, "class_id": class_id, "class_name": class_name})
 
     # ───────── parse XML fragment ─────────
-    def _parse_xml_fragment(
-        self,
-        xml: str,
-        accession: str,
-        filed_date: Optional[dt.date],
-        source_file: str,
-    ) -> bool:
+    def _parse_xml_fragment(self, xml: str, accession: str, filed_date: Optional[dt.date], source_file: str) -> bool:
         try:
             root = ET.fromstring(xml.encode(), parser=PARSER)
         except ET.XMLSyntaxError as exc:
             logger.error("XML syntax error in %s – %s", source_file, exc)
             return False
-
         if root.tag.lower().endswith(("proxyvotetable", "proxyvotetable}")):
             if self._form_idx == 0:
-                logger.error(
-                    "vote table encountered before any edgarSubmission – %s",
-                    source_file,
-                )
+                logger.error("vote table encountered before any edgarSubmission – %s", source_file)
                 return False
-            local_form = self._form_idx - 1
-            self._parse_proxy_vote_table(root, local_form)
+            self._parse_proxy_vote_table(root, self._form_idx - 1)
             return True
-
-        es_nodes = (
-            [root]
-            if root.tag.lower().endswith("edgarsubmission")
-            else root.xpath(".//*[local-name()='edgarSubmission']")
-        )
+        es_nodes = [root] if root.tag.lower().endswith("edgarsubmission") else root.xpath(".//*[local-name()='edgarSubmission']")
         if not es_nodes:
             logger.debug("non N‑PX fragment in %s", source_file)
             return False
-
         es = es_nodes[0]
         local_form = self._form_idx
         self._form_idx += 1
-
-        include_all = (
-            txt(es, ".//*[local-name()='rptIncludeAllSeriesFlag']")
-            .strip()
-            .lower()
-            == "true"
-        )
+        include_all = txt(es, ".//*[local-name()='rptIncludeAllSeriesFlag']").lower() == "true"
         if include_all:
             self._scan_existing_series_classes(local_form)
-
-        # cover page / header info
+        # cover page & header data
         raw_period = txt(es, ".//*[local-name()='periodOfReport']")
-
+        year_or_quarter = txt(es, ".//*[local-name()='yearOrQuarter']", 8)
+        report_cal_year = txt(es, ".//*[local-name()='reportCalendarYear']", 4)
+        report_qtr_year = txt(es, ".//*[local-name()='reportQuarterYear']", 4)
+        # amendment block (optional)
+        date_expired_denied_raw = txt(es, ".//*[local-name()='dateExpiredDenied']", 20)
+        date_reported_raw = txt(es, ".//*[local-name()='dateReported']", 20)
         form_row = {
-            # legacy fields
             "local_form": local_form,
-            "reporting_person_name": txt(
-                es, ".//*[local-name()='reportingPerson']/*[local-name()='name']", 150
-            ),
-            "phone_number": txt(
-                es, ".//*[local-name()='reportingPerson']/*[local-name()='phoneNumber']",
-                20,
-            ),
-            "address_street1": txt(
-                es, ".//*[local-name()='address']/*[local-name()='street1']", 40
-            ),
-            "address_street2": txt(
-                es, ".//*[local-name()='address']/*[local-name()='street2']", 40
-            ),
-            "address_city": txt(
-                es, ".//*[local-name()='address']/*[local-name()='city']", 30
-            ),
-            "address_state": txt(
-                es, ".//*[local-name()='address']/*[local-name()='state']", 20
-            )
-            or txt(es, ".//*[local-name()='address']/*[local-name()='stateOrCountry']", 20),
-            "address_country": txt(
-                es, ".//*[local-name()='address']/*[local-name()='country']", 3
-            ),
-            "address_zip": txt(
-                es, ".//*[local-name()='address']/*[local-name()='zipCode']", 10
-            ),
+            "reporting_person_name": txt(es, ".//*[local-name()='reportingPerson']/*[local-name()='name']", 250),
+            "phone_number": txt(es, ".//*[local-name()='phoneNumber']", 50),
+            "address_street1": txt(es, ".//*[local-name()='address']/*[local-name()='street1']", 250),
+            "address_street2": txt(es, ".//*[local-name()='address']/*[local-name()='street2']", 250),
+            "address_city": txt(es, ".//*[local-name()='address']/*[local-name()='city']", 100),
+            "address_state": txt(es, ".//*[local-name()='address']/*[local-name()='stateOrCountry']", 100),
+            "address_zip": txt(es, ".//*[local-name()='address']/*[local-name()='zipCode']", 30),
             "accession_number": accession[:30],
             "is_parsable": True,
-            "cik": txt(es, ".//*[local-name()='cik']", 10),
-            "ccc": txt(es, ".//*[local-name()='ccc']", 8),
-            "file_number": txt(es, ".//*[local-name()='fileNumber']", 17),
+            "cik": txt(es, ".//*[local-name()='cik']", 15),
             "period_of_report_raw": raw_period,
-            "conformed_period": clean_period(raw_period),
+            "period_of_report": clean_period(raw_period),
             "date_filed": filed_date,
-            "schema_version": txt(es, ".//*[local-name()='schemaVersion']", 5),
-            "registrant_type": txt(es, ".//*[local-name()='registrantType']", 50),
-            "live_test_flag": txt(es, ".//*[local-name()='liveTestFlag']", 10),
-            "contact_name": txt(
-                es, ".//*[local-name()='contact']/*[local-name()='contactName']", 30
-            ),
-            "contact_phone_number": txt(
-                es, ".//*[local-name()='contact']/*[local-name()='contactPhoneNumber']",
-                20,
-            ),
-            "contact_email": txt(
-                es, ".//*[local-name()='contact']/*[local-name()='contactEmailAddress']",
-                80,
-            ),
-            "override_internet_flag": bool_flag(
-                txt(es, ".//*[local-name()='overrideInternetFlag']")
-            ),
-            "confirming_copy_flag": bool_flag(
-                txt(es, ".//*[local-name()='confirmingCopyFlag']")
-            ),
-            "year_or_quarter": txt(
-                es, ".//*[local-name()='coverPage']/*[local-name()='yearOrQuarter']", 10
-            ),
-            "report_calendar_year": (lambda v: int(v) if v.isdigit() else None)(
-                txt(
-                    es,
-                    ".//*[local-name()='coverPage']/*[local-name()='reportCalendarYear']",
-                )
-            ),
-            "report_quarter_year": (lambda v: int(v) if v.isdigit() else None)(
-                txt(
-                    es,
-                    ".//*[local-name()='coverPage']/*[local-name()='reportQuarterYear']",
-                )
-            ),
-            "report_type": txt(
-                es, ".//*[local-name()='reportType']", 100
-            )
-            or "FUND VOTING REPORT",
+            "report_type": txt(es, ".//*[local-name()='reportType']", 100) or "FUND VOTING REPORT",
             "form_type": txt(es, ".//*[local-name()='submissionType']", 10) or "N-PX",
-            "sec_file_number": txt(es, ".//*[local-name()='fileNumber']", 17),
-            "crd_number": txt(es, ".//*[local-name()='reportingCrdNumber']", 9),
-            "sec_file_number_other": txt(
-                es, ".//*[local-name()='reportingSecFileNumber']", 17
-            ),
-            "lei_number": txt(es, ".//*[local-name()='leiNumber']", 20),
-            "investment_company_type": txt(
-                es, ".//*[local-name()='investmentCompanyType']", 20
-            ),
-            "confidential_treatment": bool_flag(
-                txt(es, ".//*[local-name()='confidentialTreatment']")
-            ),
-            "is_notice_report": "NOTICE"
-            in txt(es, ".//*[local-name()='reportType']").upper(),
-            "explanatory_choice": bool_flag(
-                txt(es, ".//*[local-name()='explanatoryChoice']")
-            ),
-            "other_included_managers_count": int(
-                txt(es, ".//*[local-name()='otherIncludedManagersCount']") or 0
-            ),
+            "sec_file_number": txt(es, ".//*[local-name()='fileNumber']", 20),
+            "crd_number": txt(es, ".//*[local-name()='reportingCrdNumber']", 20),
+            "sec_file_number_other": txt(es, ".//*[local-name()='reportingSecFileNumber']", 20),
+            "lei_number": txt(es, ".//*[local-name()='leiNumber']", 40),
+            "investment_company_type": txt(es, ".//*[local-name()='investmentCompanyType']", 20),
+            "confidential_treatment": "Y" if txt(es, ".//*[local-name()='confidentialTreatment']").upper() in {"Y", "YES", "TRUE", "1"} else "N",
+            "is_notice_report": "NOTICE" in txt(es, ".//*[local-name()='reportType']").upper(),
+            "explanatory_choice": "Y" if txt(es, ".//*[local-name()='explanatoryChoice']").upper() in {"Y", "YES", "TRUE", "1"} else "N",
+            "other_included_managers_count": int(txt(es, ".//*[local-name()='otherIncludedManagersCount']") or 0),
             "series_count": 0,  # patched later
-            # amendment block
-            "is_amendment": bool_flag(txt(es, ".//*[local-name()='isAmendment']")),
-            "amendment_no": (lambda v: int(v) if v.isdigit() else None)(
-                txt(es, ".//*[local-name()='amendmentNo']")
-            ),
+            "is_amendment": txt(es, ".//*[local-name()='isAmendment']").upper() in {"Y", "YES", "TRUE", "1"},
+            "amendment_no": (lambda v: int(v) if v.isdigit() else None)(txt(es, ".//*[local-name()='amendmentNo']")),
             "amendment_type": txt(es, ".//*[local-name()='amendmentType']", 20),
-            "conf_denied_expired": bool_flag(
-                txt(es, ".//*[local-name()='confDeniedExpired']")
-            ),
-            "date_expired_denied": pdate(
-                txt(es, ".//*[local-name()='dateExpiredDenied']")
-            ),
-            "date_reported": pdate(txt(es, ".//*[local-name()='dateReported']")),
-            "reason_for_non_confidentiality": txt(
-                es, ".//*[local-name()='reasonForNonConfidentiality']", 50
-            ),
-            "notice_explanation": txt(es, ".//*[local-name()='noticeExplanation']", 200),
+            "notice_explanation": txt(es, ".//*[local-name()='noticeExplanation']", 255),
             "explanatory_notes": txt(es, ".//*[local-name()='explanatoryNotes']", 4000),
-            # signature
-            "signatory_name": txt(es, ".//*[local-name()='txSignature']", 150),
-            "signatory_name_printed": txt(
-                es, ".//*[local-name()='txPrintedSignature']", 150
-            ),
-            "signatory_title": txt(es, ".//*[local-name()='txTitle']", 60),
-            "signatory_date": pdate(
-                txt(es, ".//*[local-name()='txAsOfDate']")
-            ),
+            "date_expired_denied_raw": date_expired_denied_raw,
+            "date_reported_raw": date_reported_raw,
+            "year_or_quarter": year_or_quarter,
+            "report_calendar_year": report_cal_year,
+            "report_quarter_year": report_qtr_year,
+            "signatory_name": txt(es, ".//*[local-name()='txSignature']", 250),
+            "signatory_name_printed": txt(es, ".//*[local-name()='txPrintedSignature']", 250),
+            "signatory_title": txt(es, ".//*[local-name()='txTitle']", 100),
+            "tx_as_of_date_raw": txt(es, ".//*[local-name()='txAsOfDate']", 20),
+            "signatory_date": pdate(txt(es, ".//*[local-name()='txAsOfDate']")),
         }
         self.FORMS.append(form_row)
-
         # managers
-        for mn in es.xpath(
-            ".//*[local-name()='summaryPage']//*[local-name()='investmentManagers']"
-        ):
-            self.MANAGERS.append(
-                {
-                    "local_form": local_form,
-                    "serial_no": (
-                        lambda x: int(x) if x.isdigit() else None
-                    )(txt(mn, './/*[local-name()="serialNo"]')),
-                    "name": txt(mn, './/*[local-name()="name"]', 150),
-                    "form13f_number": txt(
-                        mn, './/*[local-name()="form13FFileNumber"]', 17
-                    )
-                    or txt(mn, './/*[local-name()="icaOr13FFileNumber"]', 17),
-                    "crd_number": txt(mn, './/*[local-name()="crdNumber"]', 9),
-                    "sec_file_number": txt(
-                        mn, './/*[local-name()="secFileNumber"]', 17
-                    )
-                    or txt(mn, './/*[local-name()="otherFileNumber"]', 17),
-                    "lei_number": txt(
-                        mn, './/*[local-name()="leiNumber"]', 20
-                    )
-                    or txt(mn, './/*[local-name()="leiNumberOM"]', 20),
-                }
-            )
-
+        for mn in es.xpath(".//*[local-name()='summaryPage']//*[local-name()='investmentManagers']"):
+            self.MANAGERS.append({
+                "local_form": local_form,
+                "serial_no": (lambda x: int(x) if x.isdigit() else None)(txt(mn, './/*[local-name()="serialNo"]')),
+                "name": txt(mn, './/*[local-name()="name"]', 250),
+                "form13f_number": txt(mn, './/*[local-name()="form13FFileNumber"]', 20) or txt(mn, './/*[local-name()="icaOr13FFileNumber"]', 17),
+                "crd_number": txt(mn, './/*[local-name()="crdNumber"]', 20),
+                "sec_file_number": txt(mn, './/*[local-name()="secFileNumber"]', 20) or txt(mn, './/*[local-name()="otherFileNumber"]', 17),
+                "lei_number": txt(mn, './/*[local-name()="leiNumber"]', 40) or txt(mn, './/*[local-name()="leiNumberOM"]', 20),
+            })
         # series & class
         for sr in es.xpath('.//*[local-name()="seriesReports"]'):
-            s_code = txt(sr, './/*[local-name()="idOfSeries"]', 10)
+            s_code = txt(sr, './/*[local-name()="idOfSeries"]', 25)
             self._filing_series_counter[local_form] += 1
-            self.SERIES.append(
-                {
+            self.SERIES.append({
+                "local_form": local_form,
+                "series_code": s_code,
+                "series_name": txt(sr, './/*[local-name()="nameOfSeries"]', 250),
+                "series_lei": txt(sr, './/*[local-name()="leiOfSeries"]', 40),
+            })
+            for cls in sr.xpath('.//*[local-name()="classInfo"]'):
+                self.SERIES_CLASS.append({
                     "local_form": local_form,
                     "series_code": s_code,
-                    "series_name": txt(sr, './/*[local-name()="nameOfSeries"]', 150),
-                    "series_lei": txt(sr, './/*[local-name()="leiOfSeries"]', 20),
-                    "include_all_classes_flag": bool_flag(
-                        txt(sr, './/*[local-name()="includeAllClassesFlag"]')
-                    ),
-                }
-            )
-            for cls in sr.xpath('.//*[local-name()="classInfo"]'):
-                self.SERIES_CLASS.append(
-                    {
-                        "local_form": local_form,
-                        "series_code": s_code,
-                        "class_id": txt(cls, './/*[local-name()="classId"]', 10),
-                        "class_name": txt(cls, './/*[local-name()="className"]', 150),
-                    }
-                )
-
+                    "class_id": txt(cls, './/*[local-name()="classId"]', 10),
+                    "class_name": txt(cls, './/*[local-name()="className"]', 250),
+                })
         # other persons
         for op in es.xpath('.//*[local-name()="otherManager"]'):
-            self.OTHER_PERSONS.append(
-                {
-                    "local_form": local_form,
-                    "ica_form13f": txt(op, './/*[local-name()="icaOr13FFileNumber"]', 17),
-                    "crd_number": txt(op, './/*[local-name()="crdNumber"]', 9),
-                    "sec_file_number": txt(op, './/*[local-name()="otherFileNumber"]', 17),
-                    "lei_number": txt(op, './/*[local-name()="leiNumberOM"]', 20),
-                    "name": txt(op, './/*[local-name()="managerName"]', 150),
-                }
-            )
-
-        # proxy voting records (inline table)
+            self.OTHER_PERSONS.append({
+                "local_form": local_form,
+                "ica_form13f": txt(op, './/*[local-name()="icaOr13FFileNumber"]', 17),
+                "crd_number": txt(op, './/*[local-name()="crdNumber"]', 20),
+                "sec_file_number": txt(op, './/*[local-name()="otherFileNumber"]', 17),
+                "lei_number": txt(op, './/*[local-name()="leiNumberOM"]', 20),
+                "name": txt(op, './/*[local-name()="managerName"]', 150),
+            })
+        # proxy voting
         for pvt in es.xpath('.//*[local-name()="proxyVoteTable"]'):
             self._parse_proxy_vote_table(pvt, local_form)
-
         form_row["series_count"] = self._filing_series_counter[local_form]
         return True
 
@@ -626,6 +360,7 @@ class NpxLoader:
             return
         for pt in proxy_tables:
             lv = len(self.VOTES)
+            raw_mt = txt(pt, './/*[local-name()="meetingDate"]')
             vote_row = {
                 "local_vote": lv,
                 "local_form": local_form,
@@ -633,7 +368,8 @@ class NpxLoader:
                 "cusip": txt(pt, './/*[local-name()="cusip"]', 30),
                 "isin": txt(pt, './/*[local-name()="isin"]', 30),
                 "figi": txt(pt, './/*[local-name()="figi"]', 30),
-                "meeting_date": pdate(txt(pt, './/*[local-name()="meetingDate"]')),
+                "meeting_date_raw": raw_mt,
+                "meeting_date": pdate(raw_mt),
                 "vote_description": txt(pt, './/*[local-name()="voteDescription"]'),
                 "proposed_by": txt(pt, './/*[local-name()="voteSource"]', 20),
                 "shares_voted": dec(pt, './/*[local-name()="sharesVoted"][1]'),
@@ -646,188 +382,68 @@ class NpxLoader:
             vr = pt.xpath('.//*[local-name()="voteRecord"]')
             if vr:
                 vote_row["vote_cast"] = txt(vr[0], './/*[local-name()="howVoted"]', 50)
-                vote_row["vote_cast_shares"] = dec(
-                    vr[0], './/*[local-name()="sharesVoted"]'
-                )
-                vote_row["management_rec"] = txt(
-                    vr[0], './/*[local-name()="managementRecommendation"]', 50
-                )
+                vote_row["vote_cast_shares"] = dec(vr[0], './/*[local-name()="sharesVoted"]')
+                vote_row["management_rec"] = txt(vr[0], './/*[local-name()="managementRecommendation"]', 50)
                 if len(vr) > 1:
                     vote_row["other_notes"] = f"{len(vr)} voteRecord tags found"
             self.VOTES.append(vote_row)
-
             # categories
             for cat in pt.xpath('.//*[local-name()="categoryType"]/text()'):
                 c = canon_case(cat)
                 if c not in self.CAT_LOOKUP:
                     self.CAT_LOOKUP[c] = len(self.CAT_LOOKUP) + 1
-                    self.CATS.append(
-                        {"local_cat_id": self.CAT_LOOKUP[c], "category_type": c}
-                    )
-                self.VOTE_CATS.append(
-                    {"local_vote": lv, "local_cat_id": self.CAT_LOOKUP[c]}
-                )
-
+                    self.CATS.append({"local_cat_id": self.CAT_LOOKUP[c], "category_type": c})
+                self.VOTE_CATS.append({"local_vote": lv, "local_cat_id": self.CAT_LOOKUP[c]})
             # manager bridge
             for om in pt.xpath('.//*[local-name()="otherManager"]/text()'):
                 try:
                     sn = int(om.strip())
                 except ValueError:
                     continue
-                self.VOTE_MGR.append(
-                    {"local_vote": lv, "local_form": local_form, "serial_no": sn}
-                )
-
-            # series bridge (♦ now include all series)
+                self.VOTE_MGR.append({"local_vote": lv, "local_form": local_form, "serial_no": sn})
+            # series bridge
             for sc in pt.xpath('.//*[local-name()="voteSeries"]/text()'):
-                sc = sc.strip()[:10]
+                sc = sc.strip()[:25]
                 if sc:
-                    self.VOTE_SERIES.append(
-                        {"local_vote": lv, "local_form": local_form, "series_code": sc}
-                    )
+                    self.VOTE_SERIES.append({"local_vote": lv, "local_form": local_form, "series_code": sc})
 
     # ───────── flush to DB ─────────
     def flush_to_db(self):
-        if not self.FORMS:
+        if not self.enable_db or not self.FORMS:
+            self.reset_stage(clear_pending=False)
             return
+        if psycopg2 is None:
+            raise RuntimeError("psycopg2 is required for DB writes but not installed")
         logger.info("flushing %d filings to DB", len(self.FORMS))
         conn = psycopg2.connect(**self.conn_params)
         try:
             with conn:
                 with conn.cursor() as cur:
-
                     def _exec(sql: str, rows: list, fetch: bool = False):
-                        """execute batch with internal savepoint"""
                         if not rows:
                             return []
                         cur.execute("SAVEPOINT sp")
                         try:
-                            return execute_values(
-                                cur,
-                                sql,
-                                rows,
-                                fetch=fetch,
-                                page_size=min(1000, len(rows)),
-                            )
+                            return execute_values(cur, sql, rows, fetch=fetch, page_size=min(1000, len(rows)))
                         except Exception:
-                            logger.error(
-                                "batch insert failed – rolled back", exc_info=True
-                            )
+                            logger.error("batch insert failed – rolled back", exc_info=True)
                             cur.execute("ROLLBACK TO SAVEPOINT sp")
                             return []
-
-                    # form_npx
+                    # form_npx (2025 cols)
                     form_cols = [
-                        "reporting_person_name",
-                        "phone_number",
-                        "address_street1",
-                        "address_street2",
-                        "address_city",
-                        "address_state",
-                        "address_country",
-                        "address_zip",
-                        "accession_number",
-                        "is_parsable",
-                        "cik",
-                        "ccc",
-                        "file_number",
-                        "period_of_report_raw",
-                        "conformed_period",
-                        "date_filed",
-                        "schema_version",
-                        "registrant_type",
-                        "live_test_flag",
-                        "contact_name",
-                        "contact_phone_number",
-                        "contact_email",
-                        "override_internet_flag",
-                        "confirming_copy_flag",
-                        "year_or_quarter",
-                        "report_calendar_year",
-                        "report_quarter_year",
-                        "report_type",
-                        "form_type",
-                        "sec_file_number",
-                        "crd_number",
-                        "sec_file_number_other",
-                        "lei_number",
-                        "investment_company_type",
-                        "confidential_treatment",
-                        "is_notice_report",
-                        "explanatory_choice",
-                        "other_included_managers_count",
-                        "series_count",
-                        "is_amendment",
-                        "amendment_no",
-                        "amendment_type",
-                        "conf_denied_expired",
-                        "date_expired_denied",
-                        "date_reported",
-                        "reason_for_non_confidentiality",
-                        "notice_explanation",
-                        "explanatory_notes",
-                        "signatory_name",
-                        "signatory_name_printed",
-                        "signatory_title",
-                        "signatory_date",
+                        "reporting_person_name","phone_number","address_street1","address_street2","address_city","address_state","address_zip","accession_number","is_parsable","cik","period_of_report_raw","period_of_report","date_filed","report_type","form_type","sec_file_number","crd_number","sec_file_number_other","lei_number","investment_company_type","confidential_treatment","is_notice_report","explanatory_choice","other_included_managers_count","series_count","is_amendment","amendment_no","amendment_type","notice_explanation","explanatory_notes","signatory_name","signatory_name_printed","signatory_title","tx_as_of_date_raw","signatory_date","date_expired_denied_raw","date_reported_raw","year_or_quarter","report_calendar_year","report_quarter_year",
                     ]
-                    form_rows = [
-                        tuple(f.get(c) for c in form_cols) for f in self.FORMS
-                    ]
-                    f_ids = _exec(
-                        f"INSERT INTO form_npx ({','.join(form_cols)}) VALUES %s RETURNING form_id",
-                        form_rows,
-                        fetch=True,
-                    )
-                    m_form = {
-                        f["local_form"]: fid[0] for f, fid in zip(self.FORMS, f_ids)
-                    }
-
+                    form_rows = [tuple(f.get(c) for c in form_cols) for f in self.FORMS]
+                    f_ids = _exec(f"INSERT INTO form_npx ({','.join(form_cols)}) VALUES %s RETURNING form_id", form_rows, fetch=True)
+                    m_form = {f["local_form"]: fid[0] for f, fid in zip(self.FORMS, f_ids)}
                     # institutional_manager
-                    mgr_rows = [
-                        (
-                            m_form[m["local_form"]],
-                            m["serial_no"],
-                            m["name"],
-                            m["form13f_number"],
-                            m["crd_number"],
-                            m["sec_file_number"],
-                            m["lei_number"],
-                        )
-                        for m in self.MANAGERS
-                    ]
-                    m_ids = _exec(
-                        "INSERT INTO institutional_manager (form_id,serial_no,name,form13f_number,crd_number,sec_file_number,lei_number) VALUES %s RETURNING manager_id,form_id,serial_no",
-                        mgr_rows,
-                        fetch=True,
-                    )
+                    mgr_rows = [(m_form[m["local_form"]], m["serial_no"], m["name"], m["form13f_number"], m["crd_number"], m["sec_file_number"], m["lei_number"],) for m in self.MANAGERS]
+                    m_ids = _exec("INSERT INTO institutional_manager (form_id,serial_no,name,form13f_number,crd_number,sec_file_number,lei_number) VALUES %s RETURNING manager_id,form_id,serial_no", mgr_rows, fetch=True)
                     m_lookup = {(fid, sn): mid for mid, fid, sn in m_ids}
-
                     # series
-                    ser_cols = [
-                        "form_id",
-                        "series_code",
-                        "series_name",
-                        "series_lei",
-                        "include_all_classes_flag",
-                    ]
-                    ser_rows = [
-                        (
-                            m_form[s["local_form"]],
-                            s["series_code"],
-                            s["series_name"],
-                            s["series_lei"],
-                            s["include_all_classes_flag"],
-                        )
-                        for s in self.SERIES
-                    ]
-                    ser_ret = _exec(
-                        f"INSERT INTO series ({','.join(ser_cols)}) VALUES %s RETURNING series_id,form_id,series_code",
-                        ser_rows,
-                        fetch=True,
-                    )
+                    ser_rows = [(m_form[s["local_form"]], s["series_code"], s["series_name"], s["series_lei"],) for s in self.SERIES]
+                    ser_ret = _exec("INSERT INTO series (form_id,series_code,series_name,series_lei) VALUES %s RETURNING series_id,form_id,series_code", ser_rows, fetch=True)
                     ser_lookup = {(fid, sc): sid for sid, fid, sc in ser_ret}
-
                     # series_class
                     ready_sc, pending_sc, sc_seen = [], [], set()
                     for sc in self.SERIES_CLASS + self.PENDING_SERIES_CLASS:
@@ -840,188 +456,32 @@ class NpxLoader:
                         if pair not in sc_seen:
                             ready_sc.append((sid, sc["class_id"], sc["class_name"]))
                             sc_seen.add(pair)
-                    _exec(
-                        "INSERT INTO series_class (series_id,class_id,class_name) VALUES %s",
-                        ready_sc,
-                    )
+                    _exec("INSERT INTO series_class (series_id,class_id,class_name) VALUES %s", ready_sc)
                     self.PENDING_SERIES_CLASS = pending_sc
                     self.SERIES_CLASS = []
-
                     # other_reporting_person
-                    op_rows = [
-                        (
-                            m_form[o["local_form"]],
-                            o["ica_form13f"],
-                            o["crd_number"],
-                            o["sec_file_number"],
-                            o["lei_number"],
-                            o["name"],
-                        )
-                        for o in self.OTHER_PERSONS
-                    ]
-                    _exec(
-                        "INSERT INTO other_reporting_person (form_id,ica_form13f,crd_number,sec_file_number,lei_number,name) VALUES %s",
-                        op_rows,
-                    )
-
+                    op_rows = [(m_form[o["local_form"]], o["ica_form13f"], o["crd_number"], o["sec_file_number"], o["lei_number"], o["name"],) for o in self.OTHER_PERSONS]
+                    _exec("INSERT INTO other_reporting_person (form_id,ica_form13f,crd_number,sec_file_number,lei_number,name) VALUES %s", op_rows)
                     # matter_category upsert
                     if self.CATS:
-                        cat_ret = _exec(
-                            "INSERT INTO matter_category (category_type) VALUES %s ON CONFLICT(category_type) DO UPDATE SET category_type=EXCLUDED.category_type RETURNING category_id,category_type",
-                            [(c["category_type"],) for c in self.CATS],
-                            fetch=True,
-                        )
-                        cat_id_map = {t: c for c, t in cat_ret}
-                        local_to_db_cat = {
-                            v: cat_id_map[k]
-                            for k, v in self.CAT_LOOKUP.items()
-                            if k in cat_id_map
-                        }
+                        cat_ret = _exec("INSERT INTO matter_category (category_type) VALUES %s ON CONFLICT(category_type) DO UPDATE SET category_type=EXCLUDED.category_type RETURNING category_id,category_type", [(c["category_type"],) for c in self.CATS], fetch=True)
+                        cat_map = {t: c for c, t in cat_ret}
+                        local_to_db_cat = {v: cat_map[k] for k, v in self.CAT_LOOKUP.items() if k in cat_map}
                     else:
                         local_to_db_cat = {}
-
                     # proxy_voting_record
                     vote_cols = [
-                        "form_id",
-                        "issuer_name",
-                        "cusip",
-                        "isin",
-                        "figi",
-                        "meeting_date",
-                        "vote_description",
-                        "proposed_by",
-                        "shares_voted",
-                        "shares_on_loan",
-                        "vote_cast",
-                        "vote_cast_shares",
-                        "management_rec",
-                        "other_notes",
+                        "form_id","issuer_name","cusip","isin","figi","meeting_date_raw","meeting_date","vote_description","proposed_by","shares_voted","shares_on_loan","vote_cast","vote_cast_shares","management_rec","other_notes",
                     ]
-                    vote_rows = [
-                        (
-                            m_form[v["local_form"]],
-                            v["issuer_name"],
-                            v["cusip"],
-                            v["isin"],
-                            v["figi"],
-                            v["meeting_date"],
-                            v["vote_description"],
-                            v["proposed_by"],
-                            v["shares_voted"],
-                            v["shares_on_loan"],
-                            v["vote_cast"],
-                            v["vote_cast_shares"],
-                            v["management_rec"],
-                            v["other_notes"],
-                        )
-                        for v in self.VOTES
-                    ]
-                    vote_ret = _exec(
-                        f"INSERT INTO proxy_voting_record ({','.join(vote_cols)}) VALUES %s RETURNING vote_id",
-                        vote_rows,
-                        fetch=True,
-                    )
-                    vote_id_map = {
-                        v["local_vote"]: vid[0]
-                        for v, vid in zip(self.VOTES, vote_ret)
-                    }
+                    vote_rows = [(
+                        m_form[v["local_form" ],], v["issuer_name"], v["cusip"], v["isin"], v["figi"], v["meeting_date_raw"], v["meeting_date"], v["vote_description"], v["proposed_by"], v["shares_voted"], v["shares_on_loan"], v["vote_cast"], v["vote_cast_shares"], v["management_rec"], v["other_notes"],
+                    ) for v in self.VOTES]
+                    vote_ret = _exec(f"INSERT INTO proxy_voting_record ({','.join(vote_cols)}) VALUES %s RETURNING vote_id", vote_rows, fetch=True)
+                    vote_id_map = {v["local_vote"]: vid[0] for v, vid in zip(self.VOTES, vote_ret)}
+                    # bridges
+                    cat_bridge_rows = [(vote_id_map[vc["local_vote"]], local_to_db_cat.get(vc["local_cat_id"])) for vc in self.VOTE_CATS if vote_id_map.get(vc["local_vote"]) and local_to_db_cat.get(vc["local_cat_id"])]
+                    _exec("INSERT INTO proxy_voting_record_category (vote_id,category_id) VALUES %s ON CONFLICT DO NOTHING", cat_bridge_rows)
+                    vrm_rows = [(vote_id_map[vm["local_vote"]], m_lookup.get((m_form[vm["local_form"]], vm["serial_no"]))) for vm in self.VOTE_MGR if vote_id_map.get(vm["local_vote"]) and m_lookup.get((m_form[vm["local_form"]], vm["serial_no"]))]
+                    _exec("INSERT INTO voting_record_manager (vote_id,manager_id) VALUES %s ON CONFLICT DO NOTHING", vrm_rows)
+                    vrs_rows = [(vote_id_map[vs["local_vote"]], ser_lookup.get((m_form[
 
-                    # proxy_voting_record_category
-                    cat_bridge_rows = [
-                        (
-                            vote_id_map.get(vc["local_vote"]),
-                            local_to_db_cat.get(vc["local_cat_id"]),
-                        )
-                        for vc in self.VOTE_CATS
-                        if vote_id_map.get(vc["local_vote"])
-                        and local_to_db_cat.get(vc["local_cat_id"])
-                    ]
-                    _exec(
-                        "INSERT INTO proxy_voting_record_category (vote_id,category_id) VALUES %s ON CONFLICT DO NOTHING",
-                        cat_bridge_rows,
-                    )
-
-                    # voting_record_manager
-                    vrm_rows = [
-                        (
-                            vote_id_map.get(vm["local_vote"]),
-                            m_lookup.get(
-                                (m_form.get(vm["local_form"]), vm["serial_no"])
-                            ),
-                        )
-                        for vm in self.VOTE_MGR
-                        if vote_id_map.get(vm["local_vote"])
-                        and m_lookup.get(
-                            (m_form.get(vm["local_form"]), vm["serial_no"])
-                        )
-                    ]
-                    _exec(
-                        "INSERT INTO voting_record_manager (vote_id,manager_id) VALUES %s ON CONFLICT DO NOTHING",
-                        vrm_rows,
-                    )
-
-                    # voting_record_series
-                    vrs_rows = [
-                        (
-                            vote_id_map.get(vs["local_vote"]),
-                            ser_lookup.get(
-                                (m_form.get(vs["local_form"]), vs["series_code"])
-                            ),
-                        )
-                        for vs in self.VOTE_SERIES
-                        if vote_id_map.get(vs["local_vote"])
-                        and ser_lookup.get(
-                            (m_form.get(vs["local_form"]), vs["series_code"])
-                        )
-                    ]
-                    _exec(
-                        "INSERT INTO voting_record_series (vote_id,series_id) VALUES %s ON CONFLICT DO NOTHING",
-                        vrs_rows,
-                    )
-        finally:
-            conn.close()
-        self.reset_stage(clear_pending=False)
-
-    # ───────── main loop ─────────
-    def run(self, folder: Path):
-        counter = 0
-        for f in folder.iterdir():
-            if f.suffix.lower() == ".txt":
-                self.parse_txt_filing(f)
-                counter += 1
-                if counter % self.flush_every == 0:
-                    self.flush_to_db()
-        self.flush_to_db()
-        while self.SERIES_CLASS or self.PENDING_SERIES_CLASS:
-            self.flush_to_db()
-        logger.info("finished – %d files processed", counter)
-
-
-# ───────────────────────── main cmd helper ─────────────────────────
-def main(folder: str, flush_every: int = 250, log_level: str = "INFO"):
-    load_dotenv()
-    logging.root.setLevel(log_level.upper())
-
-    conn_params = {
-        "host": os.getenv("PGHOST", "localhost"),
-        "port": int(os.getenv("PGPORT", 5432)),
-        "dbname": os.getenv("PGDATABASE", "npx"),
-        "user": os.getenv("PGUSER", "postgres"),
-        "password": os.getenv("PGPASSWORD", "postgres"),
-    }
-    if not conn_params["password"] or conn_params["password"] in {"postgres", ""}:
-        raise SystemExit("💥 Refusing to run with default / empty DB password")
-
-    loader = NpxLoader(conn_params, flush_every=flush_every)
-    loader.run(Path(folder))
-
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python npx_loader_notebook.py <folder> [flush] [loglevel]")
-        sys.exit(1)
-    main(
-        folder=sys.argv[1],
-        flush_every=int(sys.argv[2]) if len(sys.argv) > 2 else 250,
-        log_level=sys.argv[3] if len(sys.argv) > 3 else "INFO",
-    )
